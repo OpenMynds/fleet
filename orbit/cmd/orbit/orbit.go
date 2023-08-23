@@ -128,6 +128,36 @@ func main() {
 			Usage:   "Disables auto updates",
 			EnvVars: []string{"ORBIT_DISABLE_UPDATES"},
 		},
+		&cli.DurationFlag{
+			Name:    "orbit-extensions-update-check-interval",
+			Usage:   "Specifies the interval duration for performing Orbit extension update checks",
+			Value:   60 * time.Second,
+			EnvVars: []string{"ORBIT_EXTENSIONS_UPDATE_CHECK_INTERVAL", "FLEETD_EXTENSIONS_UPDATE_CHECK_INTERVAL"},
+		},
+		&cli.DurationFlag{
+			Name:    "orbit-flags-check-interval",
+			Usage:   "Defines the time interval at which Orbit flags are checked for updates",
+			Value:   30 * time.Second,
+			EnvVars: []string{"ORBIT_FLAGS_CHECK_INTERVAL", "FLEETD_FLAGS_CHECK_INTERVAL"},
+		},
+		&cli.DurationFlag{
+			Name:    "orbit-server-capabilities-check-interval",
+			Usage:   "Determines the frequency at which Orbit verifies the server capabilities for changes",
+			Value:   5 * time.Minute,
+			EnvVars: []string{"ORBIT_SERVER_CAPABILITIES_CHECK_INTERVAL", "FLEETD_SERVER_CAPABILITIES_CHECK_INTERVAL"},
+		},
+		&cli.DurationFlag{
+			Name:    "orbit-enroll-retry-interval",
+			Usage:   "Sets the delay between orbit enrollment retries when failures happen",
+			Value:   constant.OrbitEnrollRetrySleep,
+			EnvVars: []string{"ORBIT_ENROLL_RETRY_INTERVAL", "FLEETD_ENROLL_RETRY_INTERVAL"},
+		},
+		&cli.IntFlag{
+			Name:    "orbit-enroll-max-attempts",
+			Usage:   "Sets the maximum times orbit enrollment will be attempted",
+			Value:   constant.OrbitEnrollMaxRetries,
+			EnvVars: []string{"ORBIT_ENROLL_MAX_ATTEMPTS", "FLEETD_ENROLL_MAX_ATTEMPTS"},
+		},
 		&cli.BoolFlag{
 			Name:    "dev-mode",
 			Usage:   "Runs in development mode",
@@ -607,6 +637,8 @@ func main() {
 			enrollSecret,
 			fleetClientCertificate,
 			orbitHostInfo,
+			service.OrbitMaxEnrollmentAttempts(c.Int("orbit-enroll-max-attempts")),
+			service.OrbitEnrollmentRetryInterval(c.Duration("orbit-enroll-retry-interval")),
 		)
 		if err != nil {
 			return fmt.Errorf("error new orbit client: %w", err)
@@ -625,7 +657,9 @@ func main() {
 			// add middleware to handle nudge installation and updates
 			const nudgeLaunchInterval = 30 * time.Minute
 			configFetcher = update.ApplyNudgeConfigFetcherMiddleware(configFetcher, update.NudgeConfigFetcherOptions{
-				UpdateRunner: updateRunner, RootDir: c.String("root-dir"), Interval: nudgeLaunchInterval,
+				UpdateRunner: updateRunner,
+				RootDir:      c.String("root-dir"),
+				Interval:     nudgeLaunchInterval,
 			})
 
 			configFetcher = update.ApplyDiskEncryptionRunnerMiddleware(configFetcher)
@@ -634,9 +668,8 @@ func main() {
 			configFetcher = update.ApplyWindowsMDMEnrollmentFetcherMiddleware(configFetcher, windowsMDMEnrollmentCommandFrequency, orbitHostInfo.HardwareUUID)
 		}
 
-		const orbitFlagsUpdateInterval = 30 * time.Second
 		flagRunner := update.NewFlagRunner(configFetcher, update.FlagUpdateOptions{
-			CheckInterval: orbitFlagsUpdateInterval,
+			CheckInterval: c.Duration("orbit-flags-check-interval"),
 			RootDir:       c.String("root-dir"),
 		})
 		// Try performing a flags update to use latest configured osquery flags from get-go.
@@ -651,9 +684,8 @@ func main() {
 		// for extensions autoupdate, we can only proceed after orbit is enrolled in fleet
 		// and all relevant things for it (like certs, enroll secrets, tls proxy, etc) is configured
 		if !c.Bool("disable-updates") || c.Bool("dev-mode") {
-			const orbitExtensionUpdateInterval = 60 * time.Second
 			extRunner := update.NewExtensionConfigUpdateRunner(configFetcher, update.ExtensionUpdateOptions{
-				CheckInterval: orbitExtensionUpdateInterval,
+				CheckInterval: c.Duration("orbit-extensions-update-check-interval"),
 				RootDir:       c.String("root-dir"),
 			}, updateRunner)
 
@@ -829,11 +861,13 @@ func main() {
 			enrollSecret,
 			fleetClientCertificate,
 			orbitHostInfo,
+			service.OrbitMaxEnrollmentAttempts(c.Int("orbit-enroll-max-attempts")),
+			service.OrbitEnrollmentRetryInterval(c.Duration("orbit-enroll-retry-interval")),
 		)
 		if err != nil {
 			return fmt.Errorf("new client for capabilities checker: %w", err)
 		}
-		capabilitiesChecker := newCapabilitiesChecker(checkerClient)
+		capabilitiesChecker := newCapabilitiesChecker(checkerClient, c.Duration("orbit-server-capabilities-check-interval"))
 		g.Add(capabilitiesChecker.actor())
 
 		registerExtensionRunner(
@@ -1200,13 +1234,15 @@ func (s *serviceChecker) Interrupt(err error) {
 // This struct and its methods are designed to play nicely with `oklog.Group`.
 type capabilitiesChecker struct {
 	client        *service.OrbitClient
+	pingInterval  time.Duration
 	interruptCh   chan struct{} // closed when interrupt is triggered
 	executeDoneCh chan struct{} // closed when execute returns
 }
 
-func newCapabilitiesChecker(client *service.OrbitClient) *capabilitiesChecker {
+func newCapabilitiesChecker(client *service.OrbitClient, pingInterval time.Duration) *capabilitiesChecker {
 	return &capabilitiesChecker{
 		client:        client,
+		pingInterval:  pingInterval,
 		interruptCh:   make(chan struct{}),
 		executeDoneCh: make(chan struct{}),
 	}
@@ -1222,7 +1258,7 @@ func (f *capabilitiesChecker) actor() (func() error, func(error)) {
 // You need to add an explicit check for each capability you want to watch for
 func (f *capabilitiesChecker) execute() error {
 	defer close(f.executeDoneCh)
-	capabilitiesCheckTicker := time.NewTicker(5 * time.Minute)
+	capabilitiesCheckTicker := time.NewTicker(f.pingInterval)
 
 	// do an initial ping to store the initial capabilities
 	if err := f.client.Ping(); err != nil {
